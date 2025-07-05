@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Audio</title>
+</head>
+<body>
+    <h1>Upload Your Journal Entry</h1>
+    {% with messages = get_flashed_messages() %}
+        {% if messages %}
+            <ul>
+                {% for message in messages %}
+                    <li>{{ message }}</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+    {% endwith %}
+    <form action="/upload" method="POST" enctype="multipart/form-data">
+        <label for="file">Choose an audio file:</label>
+        <input type="file" name="file" id="file" accept="audio/*" required>
+        <button type="submit">Upload</button>
+    </form>
+</body>
+</html>
