@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Ask Journal</title></head>
+<body>
+  <h1>Ask Your Journal</h1>
+  <form method="POST">
+    <input type="text" name="question" placeholder="e.g. What did I forget last Thursday?" required>
+    <button type="submit">Ask</button>
+  </form>
+  {% if answer %}
+    <h3>Answer:</h3>
+    <p>{{ answer }}</p>
+  {% endif %}
+</body>
+</html>

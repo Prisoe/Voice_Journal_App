@@ -1,0 +1,10 @@
+# Sample addition to app.py for viewing journal queries via web UI
+from flask import Flask, request, render_template
+
+@app.route('/query', methods=['GET', 'POST'])
+def query():
+    answer = None
+    if request.method == 'POST':
+        question = request.form['question']
+        answer = query_journal(question)  # You need to import this function from query.py
+    return render_template('query.html', answer=answer)
