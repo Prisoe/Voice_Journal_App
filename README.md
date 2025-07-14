@@ -12,7 +12,7 @@ This project is a voice-first journaling system that allows users to **record au
   - Audio stored in **Amazon S3**
   - Transcripts saved in **DynamoDB**
 - 🧠 **Query Your Life:** Ask natural questions like:
-  > _"What did I say I forgot to buy two weeks ago?"_  
+  > _"What did I say I forget to buy two weeks ago?"_  
   > _"Why was I stressed last Thursday?"_
 - 🔍 **RAG Integration:**
   - Embeds transcripts using **OpenAI embeddings**
