@@ -2,7 +2,6 @@ import os
 import uuid
 import time
 import pickle
-import io
 from datetime import datetime, date
 from pathlib import Path
 
@@ -16,32 +15,9 @@ from dotenv import load_dotenv
 from botocore.exceptions import ClientError
 
 # =========================================================
-# IMPORTANT: Configure FFmpeg/FFprobe BEFORE importing pydub/audiorecorder
+# Streamlit native recording (NO pydub / NO audiorecorder)
+# ✅ Works on Render without PyAudio/PortAudio/FFmpeg headaches
 # =========================================================
-HERE = Path(__file__).resolve().parent
-BIN_DIR = HERE / "bin"
-
-# Ensure this Streamlit/Python process can find ffmpeg/ffprobe (Windows venv often can't)
-if BIN_DIR.exists():
-    os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ.get("PATH", "")
-
-from pydub import AudioSegment
-
-# Explicit absolute paths (belt + suspenders)
-if os.name == "nt":
-    ffmpeg_exe = BIN_DIR / "ffmpeg.exe"
-    ffprobe_exe = BIN_DIR / "ffprobe.exe"
-else:
-    ffmpeg_exe = BIN_DIR / "ffmpeg"
-    ffprobe_exe = BIN_DIR / "ffprobe"
-
-if ffmpeg_exe.exists():
-    AudioSegment.converter = str(ffmpeg_exe)
-if ffprobe_exe.exists():
-    AudioSegment.ffprobe = str(ffprobe_exe)
-
-# Import AFTER ffmpeg setup
-from audiorecorder import audiorecorder
 
 # -------------------------
 # Config
@@ -89,6 +65,7 @@ dynamodb = boto3.resource(
 )
 table = dynamodb.Table(DDB_TABLE)
 
+
 # -------------------------
 # Helpers
 # -------------------------
@@ -96,17 +73,20 @@ def inject_css():
     st.markdown(
         """
         <style>
-          .block-container { padding-top: 1.2rem; }
+          .block-container { padding-top: 1rem; }
+          [data-testid="stHeader"] { height: 0rem; }
           header { visibility: hidden; }
           [data-testid="stToolbar"] { visibility: hidden; height: 0; position: fixed; }
-          .vj-title { font-size: 2.2rem; font-weight: 800; margin-bottom: .2rem; }
-          .vj-sub { opacity: .75; margin-bottom: 1.2rem; }
+
+          .vj-title { font-size: 2.0rem; font-weight: 900; margin: 0 0 .2rem 0; padding: 0; line-height: 1.15; }
+          .vj-sub { opacity: .75; margin: 0 0 1.2rem 0; padding: 0; }
           .vj-card {
-            border: 1px solid rgba(255,255,255,.08);
+            border: 1px solid rgba(255,255,255,.10);
             border-radius: 18px;
             padding: 16px 18px;
-            background: rgba(255,255,255,.02);
+            background: rgba(255,255,255,.03);
           }
+          .vj-muted { opacity: .75; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -145,6 +125,10 @@ def simple_auth():
 
 
 def to_transcribe_media_format(ext: str) -> str:
+    """
+    Amazon Transcribe MediaFormat allowed values include:
+    mp3, mp4, wav, flac, ogg, amr, webm, m4a
+    """
     ext = (ext or "").lower().strip(".")
     if ext in ["wave"]:
         return "wav"
@@ -179,11 +163,9 @@ def wait_for_transcription(job_name: str, poll_seconds: int = 5, timeout_seconds
         if status == "COMPLETED":
             return job["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
         if status == "FAILED":
-            st.error(f"Transcribe failed: {job['TranscriptionJob'].get('FailureReason', 'Unknown')}")
             return None
         time.sleep(poll_seconds)
         waited += poll_seconds
-    st.error("Transcription timed out.")
     return None
 
 
@@ -218,25 +200,30 @@ def scan_entries():
     return items
 
 
-def safe_aws_transcribe_from_wav_bytes(wav_bytes: bytes, entry_date_str: str):
+def safe_aws_transcribe_from_bytes(audio_bytes: bytes, ext: str, entry_date_str: str):
     """
-    Uploads bytes to S3 (wav), runs AWS Transcribe, returns transcript text or (None, err_dict).
+    Uploads bytes to S3, runs AWS Transcribe, returns transcript text or (None, err_dict).
     err_dict: {"code": "...", "message": "..."}
     """
     try:
-        media_url, s3_key = upload_bytes_to_s3(wav_bytes, "wav", entry_date_str)
-        job_name = start_transcription(media_url, "wav")
+        media_format = to_transcribe_media_format(ext)
+        media_url, s3_key = upload_bytes_to_s3(audio_bytes, ext, entry_date_str)
+
+        job_name = start_transcription(media_url, media_format)
         transcript_uri = wait_for_transcription(job_name)
+
         if not transcript_uri:
-            return None, {"code": "TranscribeFailed", "message": "Transcription did not complete."}
+            return None, {"code": "TranscribeFailed", "message": "Transcription did not complete."}, (media_url, s3_key)
+
         txt = fetch_transcript_text(transcript_uri)
-        return txt, None
+        return txt, None, (media_url, s3_key)
+
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "ClientError")
         msg = e.response.get("Error", {}).get("Message", str(e))
-        return None, {"code": code, "message": msg}
+        return None, {"code": code, "message": msg}, (None, None)
     except Exception as e:
-        return None, {"code": "UnknownError", "message": str(e)}
+        return None, {"code": "UnknownError", "message": str(e)}, (None, None)
 
 
 # ---------- RAG ----------
@@ -344,20 +331,22 @@ Answer:
 
 
 # -------------------------
-# Session state init (important for discard behavior)
+# Session state init (required for discard behavior)
 # -------------------------
 def ensure_state():
-    # Record tab
+    # Record tab state
     st.session_state.setdefault("record_audio_bytes", None)
     st.session_state.setdefault("record_audio_ext", None)
     st.session_state.setdefault("record_show_preview", False)
-    st.session_state.setdefault("record_recorder_key", 0)
+    st.session_state.setdefault("record_input_key", 0)
 
-    # Voice question (RAG tab)
+    # Voice question state
     st.session_state.setdefault("voice_q_audio_bytes", None)
+    st.session_state.setdefault("voice_q_audio_ext", None)
     st.session_state.setdefault("voice_q_show_preview", False)
     st.session_state.setdefault("voice_q_transcript", "")
-    st.session_state.setdefault("voice_q_recorder_key", 0)
+    st.session_state.setdefault("voice_q_input_key", 0)
+
 
 ensure_state()
 
@@ -368,8 +357,12 @@ ensure_state()
 st.set_page_config(page_title="Voice Journal", page_icon="🎙️", layout="wide")
 inject_css()
 
+# Title (HTML avoids the weird truncation you saw with st.title)
 st.markdown('<div class="vj-title">🎙️ Voice Journaling Assistant</div>', unsafe_allow_html=True)
-st.markdown('<div class="vj-sub">Record daily voice journals, store them, and query your memories with RAG.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="vj-sub">Record daily voice journals, store them, and query your memories with RAG.</div>',
+    unsafe_allow_html=True,
+)
 
 require_env()
 if not simple_auth():
@@ -377,7 +370,9 @@ if not simple_auth():
 
 tabs = st.tabs(["🎙️ Record", "📅 Entries", "🧠 Ask (RAG)"])
 
-# ---------- Record ----------
+# =========================================================
+# TAB 1: Record
+# =========================================================
 with tabs[0]:
     st.markdown('<div class="vj-card">', unsafe_allow_html=True)
     st.subheader("Record today's journal")
@@ -389,29 +384,18 @@ with tabs[0]:
     colA, colB = st.columns([2.2, 1])
 
     with colA:
-        # IMPORTANT: give the recorder a changing key so discard can remount it
-        try:
-            audio = audiorecorder(
-                "🎤 Click to record",
-                "⏺️ Recording...",
-                key=f"recorder_record_{st.session_state.record_recorder_key}",
-            )
-        except FileNotFoundError:
-            st.error(
-                "FFprobe/FFmpeg not found by this Streamlit process.\n\n"
-                "Confirm `voice_journal_app/bin/ffprobe.exe` and `voice_journal_app/bin/ffmpeg.exe` exist "
-                "and that PATH injection happens before importing `audiorecorder`."
-            )
-            audio = []
+        # Recorder (native streamlit)
+        audio_file = st.audio_input(
+            "🎤 Record journal audio",
+            key=f"audio_in_record_{st.session_state.record_input_key}",
+        )
 
-        # If user recorded, store bytes
-        if hasattr(audio, "__len__") and len(audio) > 0:
-            wav_bytes = audio.export(format="wav").read()
-            st.session_state.record_audio_bytes = wav_bytes
+        if audio_file is not None:
+            audio_bytes = audio_file.read()
+            st.session_state.record_audio_bytes = audio_bytes
             st.session_state.record_audio_ext = "wav"
             st.session_state.record_show_preview = True
 
-        # Show preview only if flag is on
         if st.session_state.record_show_preview and st.session_state.record_audio_bytes:
             st.audio(st.session_state.record_audio_bytes, format="audio/wav")
 
@@ -427,6 +411,7 @@ with tabs[0]:
 
     with colB:
         st.markdown("#### Actions")
+
         discard = st.button("🗑️ Discard recording", use_container_width=True)
         save = st.button(
             "✅ Save + Transcribe",
@@ -435,40 +420,32 @@ with tabs[0]:
         )
 
         if discard:
-            # Clear state + force recorder remount
             st.session_state.record_audio_bytes = None
             st.session_state.record_audio_ext = None
             st.session_state.record_show_preview = False
-            st.session_state.record_recorder_key += 1
+            st.session_state.record_input_key += 1  # remount audio_input
             st.rerun()
 
         if save and st.session_state.record_audio_bytes:
             chosen_bytes = st.session_state.record_audio_bytes
             chosen_ext = st.session_state.record_audio_ext or "wav"
-            media_format = to_transcribe_media_format(chosen_ext)
 
-            # Upload to S3
-            with st.spinner("Uploading to S3..."):
-                media_url, s3_key = upload_bytes_to_s3(chosen_bytes, chosen_ext, entry_date_str)
+            # Try AWS Transcribe safely (app must never crash)
+            with st.spinner("Uploading + transcribing..."):
+                transcript_text, err, (media_url, s3_key) = safe_aws_transcribe_from_bytes(
+                    chosen_bytes, chosen_ext, entry_date_str
+                )
 
-            # Try AWS Transcribe (safe)
-            transcript_text = None
-            try:
-                with st.spinner("Starting AWS Transcribe..."):
-                    job_name = start_transcription(media_url, media_format)
-                with st.spinner("Waiting for AWS Transcribe to finish..."):
-                    transcript_uri = wait_for_transcription(job_name, poll_seconds=5, timeout_seconds=600)
-                if transcript_uri:
-                    with st.spinner("Fetching AWS transcript..."):
-                        transcript_text = fetch_transcript_text(transcript_uri)
-            except ClientError as e:
-                st.error("AWS Transcribe failed (handled safely — app will not crash).")
-                code = e.response.get("Error", {}).get("Code", "Unknown")
-                msg = e.response.get("Error", {}).get("Message", str(e))
-                st.write(f"**Error Code:** `{code}`")
-                st.write(f"**Message:** {msg}")
-
-            if transcript_text:
+            if err:
+                st.error("Could not transcribe right now (handled safely — app will not crash).")
+                st.write(f"**Error Code:** `{err['code']}`")
+                st.write(f"**Message:** {err['message']}")
+                st.info(
+                    "If you're seeing `SubscriptionRequiredException`, you need to enable/subscribe to AWS Transcribe "
+                    "on that AWS account (or use a different transcription method)."
+                )
+            else:
+                # Save to DynamoDB only if transcription succeeded
                 with st.spinner("Saving to DynamoDB..."):
                     entry_id = str(uuid.uuid4())
                     save_to_dynamodb(entry_id, entry_date_str, media_url, s3_key, transcript_text)
@@ -477,14 +454,16 @@ with tabs[0]:
                 st.markdown("**Transcript:**")
                 st.write(transcript_text)
 
-                # Clear recording after save
+                # Clear UI after save
                 st.session_state.record_audio_bytes = None
                 st.session_state.record_audio_ext = None
                 st.session_state.record_show_preview = False
-                st.session_state.record_recorder_key += 1
+                st.session_state.record_input_key += 1
                 st.rerun()
 
-# ---------- Entries ----------
+# =========================================================
+# TAB 2: Entries
+# =========================================================
 with tabs[1]:
     st.subheader("Browse entries")
     entries = scan_entries()
@@ -503,7 +482,9 @@ with tabs[1]:
             st.write(e.get("transcription", ""))
             st.divider()
 
-# ---------- Ask ----------
+# =========================================================
+# TAB 3: Ask (RAG)
+# =========================================================
 with tabs[2]:
     st.subheader("Ask your journal (RAG + LLM)")
 
@@ -529,46 +510,39 @@ with tabs[2]:
 
     with col1:
         st.markdown("#### Ask by typing")
-        question = st.text_input("Type a question", placeholder="e.g. What did I do last Thursday?")
+        typed_q = st.text_input("Type a question", placeholder="e.g. What did I do last Thursday?")
 
         st.divider()
 
         st.markdown("#### Ask by voice (record → auto-transcribe → edit → ask)")
+        q_audio_file = st.audio_input(
+            "🎧 Record question",
+            key=f"audio_in_voiceq_{st.session_state.voice_q_input_key}",
+        )
 
-        try:
-            q_audio = audiorecorder(
-                "🎧 Record question",
-                "⏺️ Recording...",
-                key=f"recorder_voiceq_{st.session_state.voice_q_recorder_key}",
-            )
-        except FileNotFoundError:
-            st.error("FFprobe/FFmpeg not found for voice-question recorder (same fix as Record tab).")
-            q_audio = []
-
-        # After recording -> automatically transcribe (safe)
-        if hasattr(q_audio, "__len__") and len(q_audio) > 0:
-            q_wav = q_audio.export(format="wav").read()
-            st.session_state.voice_q_audio_bytes = q_wav
+        # When user records, automatically transcribe (safe, shows subscription error if any)
+        if q_audio_file is not None:
+            q_bytes = q_audio_file.read()
+            st.session_state.voice_q_audio_bytes = q_bytes
+            st.session_state.voice_q_audio_ext = "wav"
             st.session_state.voice_q_show_preview = True
 
-            # auto transcribe with AWS (safe, will show subscription error)
             with st.spinner("Transcribing your voice question..."):
-                txt, err = safe_aws_transcribe_from_wav_bytes(q_wav, entry_date_str)
+                txt, err, _ = safe_aws_transcribe_from_bytes(q_bytes, "wav", date.today().isoformat())
 
             if txt:
                 st.session_state.voice_q_transcript = txt
             else:
-                # Keep transcript editable; show error but do not crash
                 if err:
-                    st.warning("Voice transcription is not available yet,  Subscribe to AWS Transcribe.")
+                    st.warning("Voice transcription is not available yet (AWS Transcribe not enabled/subscribed).")
                     st.write(f"**Error Code:** `{err['code']}`")
                     st.write(f"**Message:** {err['message']}")
 
-        # Preview audio only if flag on
+        # Preview audio only if visible flag on
         if st.session_state.voice_q_show_preview and st.session_state.voice_q_audio_bytes:
             st.audio(st.session_state.voice_q_audio_bytes, format="audio/wav")
 
-        # Transcript editor
+        # Transcript editor (always available)
         st.session_state.voice_q_transcript = st.text_area(
             "Voice transcript (edit before asking)",
             value=st.session_state.voice_q_transcript,
@@ -576,35 +550,41 @@ with tabs[2]:
             placeholder="If transcription is enabled, your transcript will appear here automatically.",
         )
 
-        c1, c2, c3 = st.columns([1.2, 1.2, 2.6])
+        c1, c2, c3 = st.columns([1.2, 1.4, 2.4])
 
         with c1:
             if st.button("🗑️ Discard voice question", use_container_width=True):
                 st.session_state.voice_q_audio_bytes = None
+                st.session_state.voice_q_audio_ext = None
                 st.session_state.voice_q_transcript = ""
                 st.session_state.voice_q_show_preview = False
-                st.session_state.voice_q_recorder_key += 1
+                st.session_state.voice_q_input_key += 1
                 st.rerun()
 
         with c2:
-            use_voice = st.checkbox("Use voice transcript as question")
+            use_voice = st.checkbox("Use voice transcript")
 
         with c3:
             ask_btn = st.button("Ask", use_container_width=True)
 
-        final_q = question
+        final_q = typed_q.strip() if typed_q else ""
         if use_voice and st.session_state.voice_q_transcript.strip():
             final_q = st.session_state.voice_q_transcript.strip()
 
         if ask_btn and final_q:
-            answer, hits = query_rag(final_q, st.session_state.index, st.session_state.docs, st.session_state.meta, k=3)
-            st.markdown("### Answer")
-            st.write(answer)
+            try:
+                answer, hits = query_rag(final_q, st.session_state.index, st.session_state.docs, st.session_state.meta, k=3)
+                st.markdown("### Answer")
+                st.write(answer)
 
-            if hits:
-                st.markdown("### Evidence (Top Matches)")
-                for h in hits:
-                    m = h["meta"]
-                    st.markdown(f"**Date:** {m.get('entry_date')}  |  **Time:** {m.get('timestamp')}")
-                    st.write(h["text"])
-                    st.divider()
+                if hits:
+                    st.markdown("### Evidence (Top Matches)")
+                    for h in hits:
+                        m = h["meta"]
+                        st.markdown(f"**Date:** {m.get('entry_date')}  |  **Time:** {m.get('timestamp')}")
+                        st.write(h["text"])
+                        st.divider()
+
+            except Exception as e:
+                st.error("RAG query failed (handled safely — app will not crash).")
+                st.write(str(e))
