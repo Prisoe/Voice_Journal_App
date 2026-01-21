@@ -1,4 +1,5 @@
 boto3~=1.42.28
+botocore~=1.42.28
 Flask~=3.1.2
 openai~=2.15.0
 faiss-cpu~=1.13.2
@@ -6,6 +7,5 @@ numpy~=2.2.6
 python-dotenv~=1.2.1
 requests~=2.32.5
 streamlit~=1.53.0
-botocore~=1.42.28
 pydub~=0.25.1
-AudioRecorder~=0.1
+audiorecorder==0.1.6
